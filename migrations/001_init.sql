@@ -1,0 +1,20 @@
+CREATE TABLE IF NOT EXISTS creation_tasks (
+  id VARCHAR(64) PRIMARY KEY,
+  user_id VARCHAR(128) NOT NULL,
+  idempotency_key VARCHAR(191) NULL,
+  prompt TEXT NOT NULL,
+  plan_json JSON NOT NULL,
+  status VARCHAR(32) NOT NULL,
+  attempt INT NOT NULL DEFAULT 0,
+  max_retries INT NOT NULL DEFAULT 2,
+  error_code VARCHAR(128) NULL,
+  error_message TEXT,
+  result_url TEXT,
+  created_at DATETIME(6) NOT NULL,
+  updated_at DATETIME(6) NOT NULL,
+  started_at DATETIME(6) NULL,
+  finished_at DATETIME(6) NULL,
+  deadline_at DATETIME(6) NULL,
+  UNIQUE KEY uk_creation_tasks_idem (user_id, idempotency_key),
+  KEY idx_creation_tasks_status_updated (status, updated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
