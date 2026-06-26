@@ -33,6 +33,8 @@ type Dialogue struct {
 }
 
 type CreationPlan struct {
+	RunID           string             `json:"run_id"`
+	TraceVersion    string             `json:"trace_version"`
 	Prompt          string             `json:"prompt"`
 	PromptType      string             `json:"prompt_type"`
 	Roles           []Role             `json:"roles"`
@@ -51,8 +53,10 @@ type CreationPlan struct {
 }
 
 type PlanningTrace struct {
+	Step       int    `json:"step"`
 	Node       string `json:"node"`
 	Source     string `json:"source"`
+	Status     string `json:"status"`
 	DurationMS int64  `json:"duration_ms"`
 	Error      string `json:"error,omitempty"`
 }

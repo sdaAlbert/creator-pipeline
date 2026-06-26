@@ -77,6 +77,41 @@ func TestRepairBranchAddsSemanticAnchor(t *testing.T) {
 	}
 }
 
+func TestPlanningTraceHasStableRunMetadata(t *testing.T) {
+	planner, err := NewPlanner(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewPlanner() error = %v", err)
+	}
+
+	plan, err := planner.Plan(context.Background(), PromptInput{
+		UserID: "u1",
+		Prompt: "Create a tutorial video for brewing coffee",
+	})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+
+	if plan.RunID == "" {
+		t.Fatal("RunID is empty")
+	}
+	if plan.TraceVersion != traceVersion {
+		t.Fatalf("TraceVersion = %q, want %q", plan.TraceVersion, traceVersion)
+	}
+	if len(plan.PlanningTrace) == 0 {
+		t.Fatal("PlanningTrace is empty")
+	}
+	for i, item := range plan.PlanningTrace {
+		if item.Step != i+1 {
+			t.Fatalf("trace step at index %d = %d, want %d", i, item.Step, i+1)
+		}
+		if item.Node == "" || item.Source == "" || item.Status == "" {
+			t.Fatalf("trace item missing stable fields: %+v", item)
+		}
+		if item.Error != "" && item.Status != "error" {
+			t.Fatalf("trace item with error has status %q: %+v", item.Status, item)
+		}
+	}
+}
 func TestSemanticQualityDetectsMissingKeywords(t *testing.T) {
 	quality := evaluateQuality("Create a commercial ad for a night riding safety light", CreationPlan{
 		PromptType: "commercial",

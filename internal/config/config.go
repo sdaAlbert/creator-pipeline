@@ -24,6 +24,7 @@ type Config struct {
 	JobTimeout        time.Duration
 	LLMConfigPath     string
 	LLMRequired       bool
+	MiniMaxStrictMode bool
 }
 
 func Load() Config {
@@ -45,6 +46,7 @@ func Load() Config {
 		JobTimeout:        time.Duration(envInt("JOB_TIMEOUT_SECONDS", 3)) * time.Second,
 		LLMConfigPath:     env("LLM_CONFIG_PATH", ""),
 		LLMRequired:       envBool("LLM_REQUIRED", false),
+		MiniMaxStrictMode: envBool("MINIMAX_STRICT_MODE", false),
 	}
 }
 

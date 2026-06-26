@@ -2,9 +2,7 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +10,7 @@ import (
 	"creator-pipeline/internal/queue"
 	"creator-pipeline/internal/storage"
 	"creator-pipeline/internal/task"
+	"creator-pipeline/internal/video"
 )
 
 type Config struct {
@@ -22,21 +21,25 @@ type Config struct {
 }
 
 type Worker struct {
-	repo    task.Repository
-	queue   queue.Queue
-	store   storage.Store
-	metrics *metrics.Registry
-	config  Config
+	repo      task.Repository
+	queue     queue.Queue
+	store     storage.Store
+	generator video.VideoGenerator
+	metrics   *metrics.Registry
+	config    Config
 }
 
-func New(repo task.Repository, q queue.Queue, store storage.Store, m *metrics.Registry, cfg Config) *Worker {
+func New(repo task.Repository, q queue.Queue, store storage.Store, generator video.VideoGenerator, m *metrics.Registry, cfg Config) *Worker {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 1
 	}
 	if cfg.JobTimeout <= 0 {
 		cfg.JobTimeout = 5 * time.Second
 	}
-	return &Worker{repo: repo, queue: q, store: store, metrics: m, config: cfg}
+	if generator == nil {
+		generator = video.NewMockGenerator()
+	}
+	return &Worker{repo: repo, queue: q, store: store, generator: generator, metrics: m, config: cfg}
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -86,13 +89,18 @@ func (w *Worker) handle(ctx context.Context, msg queue.Message) {
 	jobCtx, cancel := context.WithTimeout(ctx, w.config.JobTimeout)
 	defer cancel()
 
-	resultPayload, err := mockModelCall(jobCtx, t)
+	result, err := w.generator.Generate(jobCtx, video.GenerationRequest{
+		TaskID:  t.ID,
+		Prompt:  t.Prompt,
+		Plan:    t.Plan,
+		Attempt: t.Attempt,
+	})
 	if err != nil {
 		w.finishFailed(ctx, t.ID, err, time.Since(started))
 		return
 	}
 
-	resultURL, err := w.store.WriteResult(ctx, t.ID, resultPayload)
+	resultURL, err := w.store.WriteResult(ctx, t.ID, result.Payload)
 	if err != nil {
 		w.finishFailed(ctx, t.ID, err, time.Since(started))
 		return
@@ -141,28 +149,4 @@ func (w *Worker) requeueIfPossible(ctx context.Context, t *task.Task) {
 	}
 	_ = w.queue.Publish(queue.Message{TaskID: updated.ID})
 	w.metrics.Retry()
-}
-
-func mockModelCall(ctx context.Context, t *task.Task) ([]byte, error) {
-	lower := strings.ToLower(t.Prompt)
-	delay := 500 * time.Millisecond
-	if strings.Contains(lower, "slow") {
-		delay = 5 * time.Second
-	}
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(delay):
-	}
-
-	if strings.Contains(lower, "fail") {
-		return nil, errors.New("mock model returned generation error")
-	}
-
-	return json.Marshal(map[string]any{
-		"task_id": t.ID,
-		"prompt":  t.Prompt,
-		"plan":    t.Plan,
-	})
 }

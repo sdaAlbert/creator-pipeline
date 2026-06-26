@@ -16,6 +16,7 @@ build/
 *.log
 tmp/
 temp/
+.tmp/
 
 # Go workspace/cache artifacts
 coverage.out
@@ -29,3 +30,13 @@ coverage.out
 # OS
 .DS_Store
 Thumbs.db
+
+# Eval artifacts
+artifacts/
+
+
+# Web frontend
+web/node_modules/
+web/dist/
+
+web/tsconfig.tsbuildinfo

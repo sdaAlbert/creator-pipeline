@@ -2,6 +2,8 @@ package eino
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -30,6 +32,8 @@ const (
 	nodeRepair        = "repair_shots"
 	nodeDialogues     = "dialogues"
 	nodePlan          = "final_plan"
+
+	traceVersion = "planning_trace.v1"
 )
 
 type Planner struct {
@@ -136,8 +140,10 @@ func initNode(ctx context.Context, in PromptInput) (PromptInput, error) {
 	return in, compose.ProcessState[*workflowState](ctx, func(ctx context.Context, s *workflowState) error {
 		s.Input = in
 		s.Plan = CreationPlan{
-			Prompt: in.Prompt,
-			Assets: in.Assets,
+			RunID:        newRunID(),
+			TraceVersion: traceVersion,
+			Prompt:       in.Prompt,
+			Assets:       in.Assets,
 			WorkflowSummary: ProductionWorkflow{
 				UsedStateGraph: true,
 				Branches:       []string{"asset-aware branch", "prompt-type branch", "quality repair branch"},
@@ -826,12 +832,26 @@ func systemPrompt() string {
 }
 
 func addTrace(plan *CreationPlan, node string, source string, duration time.Duration, errText string) {
+	status := "success"
+	if errText != "" {
+		status = "error"
+	}
 	plan.PlanningTrace = append(plan.PlanningTrace, PlanningTrace{
+		Step:       len(plan.PlanningTrace) + 1,
 		Node:       node,
 		Source:     source,
+		Status:     status,
 		DurationMS: duration.Milliseconds(),
 		Error:      errText,
 	})
+}
+
+func newRunID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("run-%d", time.Now().UTC().UnixNano())
+	}
+	return "run_" + hex.EncodeToString(b[:])
 }
 
 func classifyErr(err error) string {

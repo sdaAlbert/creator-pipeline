@@ -1,4 +1,4 @@
-# CreatorPipeline
+﻿# CreatorPipeline
 
 CreatorPipeline is a production-style AI creation workflow backend built with Go and Eino. It turns a user prompt and optional media assets into a structured creation plan, persists the task, dispatches it asynchronously, stores the generated result, and exposes task state plus operational metrics.
 
@@ -14,7 +14,7 @@ This repository demonstrates that flow end to end:
 - The API turns the plan into a durable creation task.
 - The worker executes the task asynchronously with retry, timeout, and cancellation support.
 - MySQL, RabbitMQ, Redis, MinIO, and Prometheus are wired in real infrastructure mode.
-- The final media generation service is intentionally mocked, so the repository stays runnable without a private video model.
+- Final media generation is isolated behind `VideoGenerator`; the default `MockGenerator` keeps the repository runnable without a private video model.
 
 ## Architecture
 
@@ -35,7 +35,8 @@ Client
   -> MySQL creation_tasks
   -> RabbitMQ creator.generation
   -> Worker
-  -> mock video generation service
+  -> VideoGenerator interface
+  -> MockGenerator or real video generation service
   -> MinIO result object
   -> CDN-style result_url
 
@@ -80,31 +81,33 @@ If the plan fails, `repair_shots` adjusts duration and injects missing prompt ke
 
 ## Planning Trace Example
 
-The API response includes `plan.planning_trace` and `plan.callback_events`, so a bad result can be located by graph node.
+The API response includes `plan.run_id`, `plan.trace_version`, `plan.planning_trace`, and `plan.callback_events`, so a bad result can be located by workflow run and graph node. Trace entries use stable `step`, `node`, `source`, `status`, `duration_ms`, and optional `error` fields.
 
 ```json
 {
   "task_id": "task-123",
   "status": "pending",
   "plan": {
+    "run_id": "run_2f5b...",
+    "trace_version": "planning_trace.v1",
     "prompt_type": "commercial",
+    "quality_score": 88,
     "quality": {
-      "passed": true,
-      "score": 88,
-      "missing_keywords": ["light", "city"],
-      "repair_attempts": 1
+      "keyword_hits": ["night", "riding"],
+      "missing_keywords": ["light", "city"]
     },
+    "repair_attempts": 1,
     "planning_trace": [
-      {"node": "init_state", "source": "state_graph", "duration_ms": 0},
-      {"node": "classify_prompt", "source": "rule", "duration_ms": 0},
-      {"node": "asset_tools", "source": "tools_node", "duration_ms": 3},
-      {"node": "roles", "source": "llm", "duration_ms": 10340},
-      {"node": "scenes", "source": "llm", "duration_ms": 30311},
-      {"node": "commercial_storyboard", "source": "llm", "duration_ms": 15870},
-      {"node": "duration_tools", "source": "tools_node", "duration_ms": 4},
-      {"node": "semantic_quality_check", "source": "semantic_rule", "duration_ms": 0},
-      {"node": "repair_shots", "source": "repair_loop", "duration_ms": 0},
-      {"node": "dialogues", "source": "llm", "duration_ms": 19927}
+      {"step": 1, "node": "init_state", "source": "state_graph", "status": "success", "duration_ms": 0},
+      {"step": 2, "node": "classify_prompt", "source": "rule", "status": "success", "duration_ms": 0},
+      {"step": 3, "node": "asset_tools", "source": "tools_node", "status": "success", "duration_ms": 3},
+      {"step": 4, "node": "roles", "source": "llm", "status": "success", "duration_ms": 10340},
+      {"step": 5, "node": "scenes", "source": "llm", "status": "success", "duration_ms": 30311},
+      {"step": 6, "node": "commercial_storyboard", "source": "llm", "status": "success", "duration_ms": 15870},
+      {"step": 7, "node": "duration_tools", "source": "tools_node", "status": "success", "duration_ms": 4},
+      {"step": 8, "node": "semantic_quality_check", "source": "semantic_rule", "status": "error", "duration_ms": 0, "error": "missing_prompt_keywords"},
+      {"step": 9, "node": "repair_shots", "source": "repair_loop", "status": "success", "duration_ms": 0},
+      {"step": 10, "node": "dialogues", "source": "llm", "status": "success", "duration_ms": 19927}
     ],
     "callback_events": [
       {"node": "commercial_storyboard", "component": "Lambda", "event": "start"},
@@ -223,7 +226,7 @@ Real infrastructure mode uses:
 
 Without an LLM config, the planner can use deterministic local generation so the project remains runnable in CI and local demos. For a real AI workflow run, provide `LLM_CONFIG_PATH` and set `LLM_REQUIRED=true`.
 
-In strict mode, the API fails task creation if any required MiniMax planning node fails. This prevents a demo from silently passing through fallback logic.
+Strict MiniMax mode is enabled by `LLM_REQUIRED=true` or `MINIMAX_STRICT_MODE=true`. Startup validates that the provider is `minimax` and that `base_url`, `model`, and, in strict mode, `api_key` are present. In strict mode, the API also fails task creation if any MiniMax planning node fails, preventing a demo from silently passing through fallback logic.
 
 PowerShell:
 
@@ -231,10 +234,11 @@ PowerShell:
 $env:INFRA_MODE = "real"
 $env:LLM_CONFIG_PATH = "C:\path\to\config.local.json"
 $env:LLM_REQUIRED = "true"
+$env:MINIMAX_STRICT_MODE = "true"
 go run ./cmd/api
 ```
 
-Expected config shape:
+Expected config shape. The loader accepts either this top-level shape or the same object under an `llm` key:
 
 ```json
 {
@@ -270,6 +274,105 @@ Redis idempotency: hit
 RabbitMQ creator.generation messages: 0
 ```
 
+## Product Demo: CreatorScript Studio
+
+CreatorScript Studio is the user-facing demo layer for this repository. It turns the existing Eino planning workflow into a local web product for short-video script and storyboard generation. The product demo does not generate real MP4 files; it generates a readable, editable, exportable script document from the planning result.
+
+Start the backend:
+
+```bash
+go run ./cmd/api
+```
+
+Start the frontend. The `web/` workbench is a dependency-free static app served by a tiny Node dev server:
+
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. In dev mode the page calls `http://localhost:8080`, so the backend CORS middleware allows local frontend origins. Use the workbench to:
+
+- enter a creative prompt and optional asset references
+- generate an async creation task
+- view task status
+- read the generated script document
+- inspect characters, scenes, storyboard rows, voice-over, and quality review
+- rewrite one shot or one dialogue without regenerating the whole script
+- export a readable Markdown script via `/api/v1/tasks/{id}/script.md`
+
+Product-facing APIs:
+
+```http
+GET /api/v1/tasks/{id}/script
+GET /api/v1/tasks/{id}/script.md
+POST /api/v1/tasks/{id}/rewrite-shot
+POST /api/v1/tasks/{id}/rewrite-dialogue
+```
+
+The web app intentionally hides raw `CreationPlan` JSON, callback events, Prometheus output, and eval reports. Those remain engineering observability tools, while the product surface focuses on the script, storyboard, review, rewrite, and export workflow.
+## Evaluation Harness
+
+CreatorPipeline includes a lightweight offline harness for evaluating planning quality across a fixed prompt dataset. The harness is intentionally deterministic: it uses rule-based graders for structure, keyword coverage, language match, duration error, repair behavior, fallback rate, LLM node success rate, and latency. This keeps regression results stable and makes prompt/model changes comparable.
+
+Dataset format:
+
+```json
+{"id":"commercial_001","prompt":"Create a commercial ad for a night riding safety light in the city","assets":[{"object_key":"uploads/light.png","kind":"image"}],"expected_type":"commercial","required_keywords":["night","riding","safety","light","city"],"language":"en","min_shots":3,"target_duration_ms":10000}
+```
+
+Run memory-mode evaluation:
+
+```bash
+go run ./cmd/eval-runner --dataset tests/evals/prompts.jsonl --out artifacts/eval-runs
+```
+
+Run strict MiniMax evaluation:
+
+```powershell
+go run ./cmd/eval-runner `
+  --dataset tests/evals/prompts.jsonl `
+  --out artifacts/eval-runs `
+  --llm-config C:\path\to\config.local.json `
+  --llm-required
+```
+
+Each run writes:
+
+```text
+artifacts/eval-runs/{run_id}/report.json
+artifacts/eval-runs/{run_id}/report.md
+artifacts/eval-runs/{run_id}/cases/{case_id}.json
+```
+
+The case artifact stores the original input, generated `CreationPlan`, `planning_trace`, `callback_events`, eval result, and any error. This turns a single bad output into a debuggable run artifact instead of a vague model complaint.
+
+Inspect a trace artifact:
+
+```bash
+go run ./cmd/trace-replay --artifact artifacts/eval-runs/{run_id}/cases/commercial_001.json --mode inspect
+```
+
+Replay the original input through the full workflow:
+
+```bash
+go run ./cmd/trace-replay --artifact artifacts/eval-runs/{run_id}/cases/commercial_001.json --mode full
+```
+
+Compare two eval runs:
+
+```bash
+go run ./cmd/eval-compare --base artifacts/eval-runs/run_a/report.json --candidate artifacts/eval-runs/run_b/report.json
+```
+
+Harness capabilities mapped to this project:
+
+- Multi-agent collaboration: Planner graph, Tool Agent via ToolsNode, deterministic Evaluator, and Repair Agent via `repair_shots`.
+- Layered memory: StateGraph state for short-term memory, trace artifact for run memory, failed eval cases as long-term regression memory.
+- Sandbox: memory mode for side-effect-free runs, Docker Compose for real infra isolation, tool allowlist for planning tools, strict LLM mode to prevent silent fallback.
+- Fault tolerance: strict LLM fail-fast, repair loop for quality issues, task status machine for worker errors, idempotency for duplicate submissions.
+- Observability: `planning_trace`, `callback_events`, report metrics, case artifacts, and Prometheus task metrics.
 ## Tests
 
 Run unit tests:
@@ -296,22 +399,33 @@ k6 run tests/k6/submit_tasks.js
 
 ```text
 cmd/api                 HTTP API and embedded worker startup
+cmd/eval-runner         Offline planning evaluation harness
+cmd/eval-compare        Regression comparison for eval reports
+cmd/trace-replay        Trace artifact inspection and full replay
 cmd/worker              Worker entry placeholder
 deployments             Docker Compose and Prometheus config
 internal/app            Creation API service
 internal/config         Environment config
 internal/eino           Eino planning graph, schema, and tests
+internal/eval           Dataset loader, deterministic graders, reports, artifacts
 internal/idempotency    Memory and Redis idempotency stores
 internal/llm            MiniMax config and chat client adapter
 internal/metrics        Prometheus text metrics registry
 internal/queue          Memory and RabbitMQ queues
+internal/script         User-facing ScriptDocument conversion, Markdown export, rewrite helpers
 internal/storage        Mock and MinIO result storage
 internal/task           Task model, state machine, memory/MySQL repositories
+internal/video          VideoGenerator interface and mock implementation
 internal/worker         Async generation worker
 migrations              MySQL schema
+tests/evals             Prompt dataset for planning evals
 tests/k6                Concurrent task submission script
+web                     Static product demo for CreatorScript Studio
 ```
 
 ## Production Boundaries
 
-This project intentionally keeps the final video model service as a mock implementation. The purpose is to show how an AI creation backend coordinates planning, task state, failure recovery, object storage, and observability. The mock worker can be replaced by a real HTTP or gRPC video generation service without changing the API contract or task state machine.
+This project intentionally keeps the final video model service as a mock implementation behind `internal/video.VideoGenerator`. The purpose is to show how an AI creation backend coordinates planning, task state, failure recovery, object storage, and observability. A real HTTP or gRPC video generation adapter can replace `MockGenerator` without changing the API contract, task state machine, or worker orchestration.
+
+
+

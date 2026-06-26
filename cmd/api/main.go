@@ -19,6 +19,7 @@ import (
 	"creator-pipeline/internal/queue"
 	"creator-pipeline/internal/storage"
 	"creator-pipeline/internal/task"
+	"creator-pipeline/internal/video"
 	"creator-pipeline/internal/worker"
 )
 
@@ -27,16 +28,23 @@ func main() {
 	cfg := config.Load()
 
 	var filler creator.JSONFiller
+	strictMiniMax := cfg.LLMRequired || cfg.MiniMaxStrictMode
+	if strictMiniMax && cfg.LLMConfigPath == "" {
+		log.Fatal("strict MiniMax mode requires LLM_CONFIG_PATH")
+	}
 	if cfg.LLMConfigPath != "" {
 		llmCfg, err := llm.LoadConfig(cfg.LLMConfigPath)
 		if err != nil {
 			log.Fatalf("load llm config: %v", err)
 		}
+		if err := llmCfg.ValidateMiniMax(strictMiniMax); err != nil {
+			log.Fatalf("validate minimax config: %v", err)
+		}
 		filler = llm.NewMiniMaxClient(llmCfg)
-		log.Printf("LLM planner enabled provider=%s model=%s", llmCfg.Provider, llmCfg.Model)
+		log.Printf("LLM planner enabled provider=%s model=%s strict=%t", llmCfg.Provider, llmCfg.Model, strictMiniMax)
 	}
 
-	planner, err := creator.NewPlanner(ctx, filler, creator.WithRequiredLLM(cfg.LLMRequired))
+	planner, err := creator.NewPlanner(ctx, filler, creator.WithRequiredLLM(strictMiniMax))
 	if err != nil {
 		log.Fatalf("build planner: %v", err)
 	}
@@ -45,7 +53,7 @@ func main() {
 	m := metrics.NewRegistry(q)
 
 	svc := app.NewService(planner, repo, q, idem, m)
-	w := worker.New(repo, q, store, m, worker.Config{
+	w := worker.New(repo, q, store, video.NewMockGenerator(), m, worker.Config{
 		Concurrency: cfg.WorkerConcurrency,
 		JobTimeout:  cfg.JobTimeout,
 		MaxRetries:  2,
@@ -136,12 +144,39 @@ func routes(svc *app.Service, repo task.Repository, m *metrics.Registry) http.Ha
 	})
 
 	mux.HandleFunc("GET /api/v1/tasks/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/")
-		if id == "" {
+		path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/v1/tasks/"), "/")
+		parts := strings.Split(path, "/")
+		if len(parts) == 0 || parts[0] == "" {
 			writeError(w, http.StatusNotFound, "not_found", "missing task id")
 			return
 		}
-		t, err := repo.Get(r.Context(), id)
+		if len(parts) == 2 {
+			switch parts[1] {
+			case "script":
+				doc, err := svc.ScriptDocument(r.Context(), parts[0])
+				if err != nil {
+					writeAppError(w, err, "script_unavailable")
+					return
+				}
+				writeJSON(w, http.StatusOK, doc)
+				return
+			case "script.md":
+				md, err := svc.ScriptMarkdown(r.Context(), parts[0])
+				if err != nil {
+					writeAppError(w, err, "script_unavailable")
+					return
+				}
+				w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(md))
+				return
+			}
+		}
+		if len(parts) != 1 {
+			writeError(w, http.StatusNotFound, "not_found", "unknown task resource")
+			return
+		}
+		t, err := repo.Get(r.Context(), parts[0])
 		if err != nil {
 			writeError(w, http.StatusNotFound, "not_found", err.Error())
 			return
@@ -172,6 +207,30 @@ func routes(svc *app.Service, repo task.Repository, m *metrics.Registry) http.Ha
 				return
 			}
 			writeJSON(w, http.StatusOK, t)
+		case "rewrite-shot":
+			var req app.RewriteRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+				return
+			}
+			doc, err := svc.RewriteShot(r.Context(), parts[0], req)
+			if err != nil {
+				writeAppError(w, err, "rewrite_failed")
+				return
+			}
+			writeJSON(w, http.StatusOK, doc)
+		case "rewrite-dialogue":
+			var req app.RewriteRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+				return
+			}
+			doc, err := svc.RewriteDialogue(r.Context(), parts[0], req)
+			if err != nil {
+				writeAppError(w, err, "rewrite_failed")
+				return
+			}
+			writeJSON(w, http.StatusOK, doc)
 		default:
 			writeError(w, http.StatusNotFound, "not_found", "unknown task action")
 		}
@@ -182,9 +241,18 @@ func routes(svc *app.Service, repo task.Repository, m *metrics.Registry) http.Ha
 		_, _ = w.Write([]byte(m.Prometheus()))
 	})
 
-	return mux
+	return withCORS(mux)
 }
 
+func writeAppError(w http.ResponseWriter, err error, code string) {
+	status := http.StatusBadRequest
+	if errors.Is(err, app.ErrTaskNotFound) {
+		status = http.StatusNotFound
+	} else if errors.Is(err, app.ErrScriptNotReady) {
+		status = http.StatusConflict
+	}
+	writeError(w, status, code, err.Error())
+}
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -193,4 +261,21 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, code string, message string) {
 	writeJSON(w, status, map[string]string{"code": code, "message": message})
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "http://localhost:5173" || origin == "http://127.0.0.1:5173" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
